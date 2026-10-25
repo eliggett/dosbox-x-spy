@@ -432,9 +432,15 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
+extern void MEM_SpyDump(void); /* motreader: defined in hardware/memory.cpp */
+extern void TRACE_Poll(void);  /* motreader: Phase-1 control channel (hardware/memory.cpp) */
+
 static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
+
+    MEM_SpyDump(); /* motreader: periodic RAM dump when DOSBOX_SPYDIR is set */
+    TRACE_Poll();  /* motreader: serve control socket at a safe point */
 
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
         uint32_t ticksNew = GetTicks();

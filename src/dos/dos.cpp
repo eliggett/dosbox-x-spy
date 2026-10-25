@@ -2090,9 +2090,31 @@ static Bitu DOS_21Handler(void) {
                 }
                 else
                 {
+                    {
+                    /* motreader: track the Spectra archive read buffer. Before
+                     * each new chunk overwrites it, dump the current contents
+                     * (the in-place-decrypted previous chunk). */
+                    extern void MEM_SpyWatch(uint32_t,uint32_t);
+                    extern void MEM_SpyDumpBuf(uint32_t,uint32_t);
+                    static uint32_t arch_buf = 0; /* guest linear addr of read buffer */
+                    uint32_t this_buf = SegPhys(ds) + reg_dx;
+                    if (arch_buf != 0 && this_buf == arch_buf)
+                        MEM_SpyDumpBuf(arch_buf, 512); /* prior chunk, pre-overwrite */
+                    uint32_t mot_pos = 0;            /* motreader: file offset of this read */
+                    Files[handle]->Seek(&mot_pos, DOS_SEEK_CUR);
                     if((fRead = DOS_ReadFile(reg_bx, dos_copybuf, &toread))) {
                         MEM_BlockWrite(SegPhys(ds) + reg_dx, dos_copybuf, toread);
                         diskio_delay_handle(reg_bx, toread);
+                        extern void TRACE_FileRead(const char*,uint32_t,uint32_t,uint32_t);
+                        TRACE_FileRead(Files[handle]->GetName(), mot_pos, this_buf, toread);
+                        if (toread >= 20 && memcmp(dos_copybuf,
+                                "Requires MOTOROLA Ra", 20) == 0) {
+                            extern void MEM_SpyWriteActivate(void);
+                            arch_buf = this_buf;
+                            MEM_SpyWatch(this_buf, 8192);
+                            MEM_SpyWriteActivate();
+                        }
+                    }
                     }
                 }
 

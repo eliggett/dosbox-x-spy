@@ -59,6 +59,7 @@ void                        MEM_A20_Enable(bool enabled);
 Bitu                        MEM_FreeTotal(void);           //Free 4 kb pages
 Bitu                        MEM_FreeLargest(void);         //Largest free 4 kb pages block
 Bitu                        MEM_TotalPages(void);          //Total amount of 4 kb pages
+void                        MEM_SpyDump(void);             //motreader: dump guest RAM if DOSBOX_SPYDIR set
 Bitu                        MEM_TotalPagesAt4GB(void);          //Total amount of 4 kb pages starting at 4GB
 Bitu                        MEM_ConventionalPages(void);
 Bitu                        MEM_AllocatedPages(MemHandle handle); // amount of allocated pages of handle

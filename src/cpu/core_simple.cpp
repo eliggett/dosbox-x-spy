@@ -33,6 +33,7 @@ extern bool do_lds_wraparound;
 #define CPU_CORE CPU_ARCHTYPE_386
 
 extern bool ignore_opcode_63;
+extern unsigned char motrace_gate;  /* motreader: per-instruction step/bp gate */
 
 #if C_DEBUG
 #include "debug.h"
@@ -195,6 +196,11 @@ Bits CPU_Core_Simple_Run(void) {
         BaseDS=SegBase(ds);
         BaseSS=SegBase(ss);
         core.base_val_ds=ds;
+        if (motrace_gate) {         /* motreader: single-step / breakpoint gate */
+            extern int TRACE_StepGate(void);
+            SAVEIP;                 /* make reg_eip exact for this instruction */
+            if (!TRACE_StepGate()) { FillFlags(); return CBRET_NONE; }
+        }
 #if C_DEBUG
 #if C_HEAVY_DEBUG
         if (DEBUG_HeavyIsBreakpoint()) {

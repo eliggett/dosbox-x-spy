@@ -1382,16 +1382,25 @@ bool mem_unalignedwrited_checked(LinearPt address,uint32_t val) {
     return false;
 }
 
+extern unsigned char motrace_memhook;            /* motreader: tracer armed */
+void TRACE_Mem(uint32_t addr,uint8_t size,uint32_t val,int iswrite);
+
 uint8_t mem_readb(const LinearPt address) {
-    return mem_readb_inline(address);
+    uint8_t v = mem_readb_inline(address);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,1,v,0);
+    return v;
 }
 
 uint16_t mem_readw(const LinearPt address) {
-    return mem_readw_inline(address);
+    uint16_t v = mem_readw_inline(address);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,2,v,0);
+    return v;
 }
 
 uint32_t mem_readd(const LinearPt address) {
-    return mem_readd_inline(address);
+    uint32_t v = mem_readd_inline(address);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,4,v,0);
+    return v;
 }
 
 #include "cpu.h"
@@ -1399,18 +1408,24 @@ uint32_t mem_readd(const LinearPt address) {
 extern bool warn_on_mem_write;
 extern CPUBlock cpu;
 
+void MEM_SpyWrite(uint32_t addr);
 void mem_writeb(LinearPt address,uint8_t val) {
 //  if (warn_on_mem_write && cpu.pmode) LOG_MSG("WARNING: post-killswitch memory write to 0x%08x = 0x%02x\n",address,val);
+    MEM_SpyWrite((uint32_t)address);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,1,val,1);
     mem_writeb_inline(address,val);
 }
 
 void mem_writew(LinearPt address,uint16_t val) {
 //  if (warn_on_mem_write && cpu.pmode) LOG_MSG("WARNING: post-killswitch memory write to 0x%08x = 0x%04x\n",address,val);
+    MEM_SpyWrite((uint32_t)address);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,2,val,1);
     mem_writew_inline(address,val);
 }
 
 void mem_writed(LinearPt address,uint32_t val) {
 //  if (warn_on_mem_write && cpu.pmode) LOG_MSG("WARNING: post-killswitch memory write to 0x%08x = 0x%08x\n",address,val);
+    if (motrace_memhook) TRACE_Mem((uint32_t)address,4,val,1);
     mem_writed_inline(address,val);
 }
 
@@ -1811,6 +1826,582 @@ bool MEM_map_ROM_alias_physmem(Bitu start,Bitu end) {
 }
 
 HostPt GetMemBase(void) { return MemBase; }
+
+/* motreader spy: periodically dump low guest RAM (<640KB) to
+ * $DOSBOX_SPYDIR/mem_NNNN.bin. No-op unless DOSBOX_SPYDIR is set. Also supports
+ * a "watch" window set by the DOS file-read hook (MEM_SpyWatch), which is dumped
+ * densely (every call, no rate limit) for a short burst so we capture the
+ * in-place decryption of the Spectra codeplug. The built-in savestate crashes,
+ * hence this. */
+#include <ctime>
+#include <sys/time.h>
+
+static uint32_t spy_watch_addr = 0;
+static uint32_t spy_watch_len = 0;
+static int      spy_watch_count = 0;   /* remaining dense dumps */
+
+void MEM_SpyWatch(uint32_t addr, uint32_t len) {
+    const char* dir = getenv("DOSBOX_SPYDIR");
+    if (dir == NULL) return;
+    spy_watch_addr = addr;
+    spy_watch_len  = len;
+    spy_watch_count = 400;  /* ~10s of 25ms dumps */
+}
+
+/* Write-watchpoint: log the code (CS:IP) that writes into the codeplug buffer
+ * region, to pinpoint the decrypt routine. Active between the archive read and
+ * the next periodic dump. */
+static int spy_wp_active = 0;
+void MEM_SpyWriteActivate(void) { if (getenv("DOSBOX_SPYDIR")) spy_wp_active = 1; }
+
+void MEM_SpyWrite(uint32_t addr) {
+    if (!spy_wp_active) return;
+    if (addr < 0x77000u || addr >= 0x79000u) return;
+    const char* dir = getenv("DOSBOX_SPYDIR");
+    if (!dir) return;
+    static uint32_t seen[128]; static int nseen = 0;
+    uint32_t csv = SegValue(cs); uint32_t ipv = reg_eip;
+    uint32_t key = (csv << 16) ^ ipv;
+    for (int i = 0; i < nseen; i++) if (seen[i] == key) return;
+    if (nseen < 128) seen[nseen++] = key;
+    char path[1200]; snprintf(path, sizeof(path), "%s/writes.log", dir);
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "write to %05x  CS:IP=%04x:%04x\n", addr, csv, ipv);
+    fclose(f);
+}
+
+/* Dump a guest buffer immediately to $DOSBOX_SPYDIR/buf_NNNNN.bin. Used by the
+ * DOS read hook to capture each archive chunk right before the next read
+ * overwrites it (i.e. the in-place-decrypted previous chunk). */
+void MEM_SpyDumpBuf(uint32_t addr, uint32_t len) {
+    const char* dir = getenv("DOSBOX_SPYDIR");
+    if (dir == NULL || MemBase == NULL) return;
+    if ((size_t)addr + len > MemSize) return;
+    static int bidx = 0;
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/buf_%05d.bin", dir, bidx++);
+    FILE* f = fopen(path, "wb");
+    if (f == NULL) return;
+    fwrite(MemBase + addr, 1, len, f);
+    fclose(f);
+}
+
+static double spy_now_ms(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec*1000.0 + (double)tv.tv_usec/1000.0;
+}
+
+void MEM_SpyDump(void) {
+    static const char* dir = getenv("DOSBOX_SPYDIR");
+    if (dir == NULL || MemBase == NULL) return;
+    char path[1200];
+
+    /* full-low-memory dumps throttled to ~25ms while active, so the burst spans
+     * the whole decode. Diff consecutive frames to find the decrypt output. */
+    if (spy_watch_count > 0) {
+        static double wlast = 0;
+        double wnow = spy_now_ms();
+        if (wnow - wlast >= 25.0) {
+            wlast = wnow;
+            static int widx = 0;
+            size_t wsz = (size_t)0xA0000u;        /* conventional memory */
+            if (wsz > MemSize) wsz = MemSize;
+            snprintf(path, sizeof(path), "%s/watch_%05d.bin", dir, widx++);
+            FILE* f = fopen(path, "wb");
+            if (f != NULL) { fwrite(MemBase, 1, wsz, f); fclose(f); }
+            spy_watch_count--;
+        }
+    }
+    (void)spy_watch_addr; (void)spy_watch_len;
+
+    /* periodic low-memory dump, ~2/sec */
+    static double last = 0;
+    static int idx = 0;
+    double now = spy_now_ms();
+    if (now - last < 500.0) return;
+    last = now;
+    size_t sz = (size_t)MEM_TotalPages() * 4096u;
+    if (sz > (size_t)0xA0000u) sz = (size_t)0xA0000u;   /* conventional memory */
+    snprintf(path, sizeof(path), "%s/mem_%04d.bin", dir, idx++);
+    FILE* f = fopen(path, "wb");
+    if (f == NULL) return;
+    fwrite(MemBase, 1, sz, f);
+    fclose(f);
+}
+
+/* ======================================================================== *
+ * motreader Phase-1 white-box tracing + control harness.
+ *
+ * A Unix-socket control channel + range-watchpoint tracer + text-screen
+ * reader + single-step micro-tracer, all driven from the single CPU thread
+ * at safe points (top of Normal_Loop and a per-instruction gate in the
+ * simple core).  Everything here is inert unless DOSBOX_CTLSOCK is set, so a
+ * normal build/run is unaffected.  Requires core=simple so that guest data
+ * reads/writes flow through the hookable mem_readX / mem_writeX below (the
+ * normal core inlines them).  See notes/PHASE1-HARNESS.md.
+ * ======================================================================== */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+extern Bitu cycle_count;                       /* retired-instruction counter (core_*) */
+extern cpu_cycles_count_t CPU_CycleMax;
+bool BIOS_AddKeyToBuffer(uint16_t code);       /* ints/bios_keyboard.cpp */
+
+enum { MOT_RUN = 0, MOT_PAUSED = 1, MOT_STEP = 2 };
+
+static int        mot_enabled   = -1;          /* -1 = not yet probed */
+static int        mot_srv_fd    = -1;
+static int        mot_cli_fd    = -1;
+static int        mot_mode      = MOT_RUN;
+static long       mot_step_budget = 0;
+static int        mot_wait_pending = 0;
+unsigned char     motrace_gate  = 0;           /* read every instruction by core_simple */
+unsigned char     motrace_memhook = 0;          /* mem accessors call the tracer */
+
+/* watch ranges */
+#define MOT_MAXW 8
+/* rw: 1=read 2=write; brk: pause the CPU after a hit (optionally only when
+ * the accessed value == val) */
+static struct { uint32_t lo, hi; int rw; int brk; int has_val; uint32_t val; } mot_watch[MOT_MAXW];
+static int mot_watch_n = 0;
+/* last break-on-watch hit (reported by the 'hit' command) */
+static struct { int valid; int write; uint32_t addr, val; uint8_t size; uint16_t cs; uint32_t eip; uint64_t cyc; } mot_hit;
+static int mot_in_gate = 0;                     /* serving from inside the CPU gate */
+
+/* INT 21h file-read log (overlay map): who read which file bytes where */
+#define MOT_MAXF 4096
+static struct { char name[16]; uint32_t pos, dest, n; uint64_t cyc; } mot_flog[MOT_MAXF];
+static int mot_flog_n = 0;
+static uint32_t mot_base = 0;                   /* reference base for relative offsets */
+
+/* breakpoints (cs:ip, real-mode) */
+#define MOT_MAXBP 8
+static struct { uint16_t cs; uint32_t ip; } mot_bp[MOT_MAXBP];
+static int mot_bp_n = 0;
+static unsigned long mot_bp_hits = 0;
+static uint16_t mot_bp_last_cs = 0; static uint32_t mot_bp_last_ip = 0;
+
+/* trace file */
+static FILE* mot_trace = NULL;
+
+/* command-line read buffer for the client socket */
+static char mot_rbuf[4096];
+static int  mot_rlen = 0;
+
+static void mot_recompute_gate(void) {
+    motrace_gate = (mot_mode != MOT_RUN || mot_bp_n > 0) ? 1 : 0;
+}
+static void mot_update_hook(void) {
+    int brk = 0;
+    for (int i = 0; i < mot_watch_n; i++) brk |= mot_watch[i].brk;
+    motrace_memhook = (mot_watch_n > 0 && (mot_trace != NULL || brk)) ? 1 : 0;
+}
+
+/* ---- binary trace writers (little-endian host) ---- */
+static void mot_w8 (uint8_t v){ if(mot_trace) fwrite(&v,1,1,mot_trace); }
+static void mot_w16(uint16_t v){ if(mot_trace) fwrite(&v,2,1,mot_trace); }
+static void mot_w32(uint32_t v){ if(mot_trace) fwrite(&v,4,1,mot_trace); }
+static void mot_w64(uint64_t v){ if(mot_trace) fwrite(&v,8,1,mot_trace); }
+
+/* Called from the mem accessors for every guest data access (core=simple). */
+void TRACE_Mem(uint32_t addr, uint8_t size, uint32_t val, int iswrite) {
+    if (mot_watch_n == 0) return;
+    int hit = 0;
+    for (int i = 0; i < mot_watch_n; i++) {
+        if (addr >= mot_watch[i].lo && addr < mot_watch[i].hi &&
+            (mot_watch[i].rw & (iswrite ? 2 : 1))) {
+            hit = 1;
+            if (mot_watch[i].brk && (!mot_watch[i].has_val || mot_watch[i].val == val)) {
+                /* break: freeze at the next instruction boundary (the gate),
+                 * i.e. right after this access's instruction, with the code
+                 * that did it still resident */
+                mot_hit.valid = 1; mot_hit.write = iswrite; mot_hit.addr = addr;
+                mot_hit.val = val; mot_hit.size = size; mot_hit.cs = (uint16_t)SegValue(cs);
+                mot_hit.eip = (uint32_t)reg_eip; mot_hit.cyc = (uint64_t)cycle_count;
+                mot_mode = MOT_PAUSED; mot_recompute_gate();
+            }
+        }
+    }
+    if (!hit || mot_trace == NULL) return;
+    mot_w8(iswrite ? 'W' : 'R');
+    mot_w64((uint64_t)cycle_count);
+    mot_w16((uint16_t)SegValue(cs));
+    mot_w32((uint32_t)reg_eip);
+    mot_w32(addr);
+    mot_w8(size);
+    mot_w32(val);
+}
+
+/* Called from the INT 21h READ handler after a successful file read. */
+void TRACE_FileRead(const char* name, uint32_t pos, uint32_t dest, uint32_t n) {
+    if (mot_enabled != 1) return;
+    const char* b = name ? strrchr(name, '\\') : NULL;
+    b = b ? b + 1 : (name ? name : "?");
+    if (mot_flog_n < MOT_MAXF) {
+        strncpy(mot_flog[mot_flog_n].name, b, sizeof(mot_flog[0].name) - 1);
+        mot_flog[mot_flog_n].name[sizeof(mot_flog[0].name) - 1] = 0;
+        mot_flog[mot_flog_n].pos = pos; mot_flog[mot_flog_n].dest = dest;
+        mot_flog[mot_flog_n].n = n; mot_flog[mot_flog_n].cyc = (uint64_t)cycle_count;
+        mot_flog_n++;
+    }
+    if (mot_trace) {        /* 'F' cyc:u64 pos:u32 dest:u32 n:u32 len:u8 name[len] */
+        mot_w8('F'); mot_w64((uint64_t)cycle_count); mot_w32(pos); mot_w32(dest); mot_w32(n);
+        int ll = (int)strlen(b); if (ll > 255) ll = 255; mot_w8((uint8_t)ll); fwrite(b, 1, ll, mot_trace);
+    }
+}
+
+/* ---- text-mode screen reader ----
+ * The BIOS data area is in conventional RAM (read via phys_readb), but the
+ * text video buffer at 0xB8000 is behind the VGA page handler under
+ * machine=svga_s3, so it must be read through mem_readb_inline (the handler
+ * path) rather than straight from MemBase. */
+static int mot_screen(char* txt, uint8_t* att, int* cols_out, int* rows_out) {
+    uint8_t mode = phys_readb(0x449);
+    if (mode == 0x07) { /* mono text */ }
+    else if (mode != 0x03 && mode != 0x02) return 0;    /* not 80col text */
+    uint32_t vbase = (mode == 0x07) ? 0xB0000u : 0xB8000u;
+    int cols = phys_readw(0x44A); if (cols <= 0 || cols > 132) cols = 80;
+    int rows = phys_readb(0x484) + 1; if (rows <= 1 || rows > 60) rows = 25;
+    uint32_t page = phys_readw(0x44E);
+    uint32_t start = vbase + page;
+    for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
+        uint32_t off = start + (uint32_t)(r*cols + c)*2u;
+        uint8_t ch = mem_readb_inline(off), at = mem_readb_inline(off+1);
+        txt[r*cols + c] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : ' ';
+        att[r*cols + c] = at;
+    }
+    *cols_out = cols; *rows_out = rows;
+    return 1;
+}
+
+/* ---- key injection ---- */
+static uint16_t mot_keycode(const char* tok) {
+    if (tok[0] && tok[1] == 0) {                 /* single printable char */
+        uint8_t a = (uint8_t)tok[0];
+        return (uint16_t)a;                      /* scan=0, ascii=a (INT16h accepts) */
+    }
+    if (!strcasecmp(tok,"enter")||!strcasecmp(tok,"ret")) return 0x1C0D;
+    if (!strcasecmp(tok,"esc"))   return 0x011B;
+    if (!strcasecmp(tok,"space")) return 0x3920;
+    if (!strcasecmp(tok,"tab"))   return 0x0F09;
+    if (!strcasecmp(tok,"bksp")||!strcasecmp(tok,"backspace")) return 0x0E08;
+    if (!strcasecmp(tok,"up"))    return 0x4800;
+    if (!strcasecmp(tok,"down"))  return 0x5000;
+    if (!strcasecmp(tok,"left"))  return 0x4B00;
+    if (!strcasecmp(tok,"right")) return 0x4D00;
+    if (!strcasecmp(tok,"home"))  return 0x4700;
+    if (!strcasecmp(tok,"end"))   return 0x4F00;
+    if (!strcasecmp(tok,"pgup"))  return 0x4900;
+    if (!strcasecmp(tok,"pgdn"))  return 0x5100;
+    if (!strcasecmp(tok,"del"))   return 0x5300;
+    if (tok[0]=='f'||tok[0]=='F') { int n=atoi(tok+1);
+        if (n>=1&&n<=10) return (uint16_t)((0x3B+(n-1))<<8);
+        if (n==11) return 0x8500; if (n==12) return 0x8600; }
+    return 0;
+}
+
+/* ---- socket helpers ---- */
+static void mot_reply(const char* s) {
+    if (mot_cli_fd < 0) return;
+    size_t n = strlen(s);
+    (void)!write(mot_cli_fd, s, n);
+    if (n == 0 || s[n-1] != '\n') (void)!write(mot_cli_fd, "\n", 1);
+}
+static int mot_has_data(void) {
+    if (mot_cli_fd < 0) return 0;
+    struct pollfd p; p.fd = mot_cli_fd; p.events = POLLIN;
+    return poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
+}
+/* read one line (blocking) into out; returns len or -1 on EOF/err */
+static int mot_readline(char* out, int cap) {
+    for (;;) {
+        for (int i = 0; i < mot_rlen; i++) {
+            if (mot_rbuf[i] == '\n') {
+                int ln = i; if (ln >= cap) ln = cap-1;
+                memcpy(out, mot_rbuf, ln); out[ln] = 0;
+                while (ln>0 && (out[ln-1]=='\r'||out[ln-1]==' ')) out[--ln]=0;
+                memmove(mot_rbuf, mot_rbuf+i+1, mot_rlen-i-1);
+                mot_rlen -= i+1;
+                return ln;
+            }
+        }
+        if (mot_rlen >= (int)sizeof(mot_rbuf)) mot_rlen = 0; /* overflow guard */
+        int n = (int)read(mot_cli_fd, mot_rbuf+mot_rlen, sizeof(mot_rbuf)-mot_rlen);
+        if (n <= 0) { if (n<0 && errno==EINTR) continue; return -1; }
+        mot_rlen += n;
+    }
+}
+
+static const char* HEX = "0123456789abcdef";
+
+/* process a single command line; returns 1 if guest should resume (continue/step/quit handled) */
+static void mot_cmd(char* line) {
+    char* cmd = strtok(line, " \t");
+    if (!cmd) { mot_reply("ok"); return; }
+
+    if (!strcmp(cmd,"ping")) { mot_reply("ok"); return; }
+
+    if (!strcmp(cmd,"regs")) {
+        char b[256];
+        snprintf(b,sizeof(b),"regs ax=%04x bx=%04x cx=%04x dx=%04x si=%04x di=%04x bp=%04x sp=%04x "
+                 "ds=%04x es=%04x ss=%04x cs=%04x ip=%04x fl=%04x cyc=%llu",
+                 reg_ax,reg_bx,reg_cx,reg_dx,reg_si,reg_di,reg_bp,reg_sp,
+                 SegValue(ds),SegValue(es),SegValue(ss),SegValue(cs),reg_ip,reg_flags,
+                 (unsigned long long)cycle_count);
+        mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"instr-count")) {
+        char b[64]; snprintf(b,sizeof(b),"cyc %llu",(unsigned long long)cycle_count); mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"read-mem")) {
+        char* sa=strtok(NULL," "); char* sl=strtok(NULL," ");
+        if(!sa||!sl){mot_reply("err args");return;}
+        uint32_t a=(uint32_t)strtoul(sa,NULL,16); int len=atoi(sl);
+        if(len<0||len>8192){mot_reply("err len");return;}
+        char* b=(char*)malloc((size_t)len*2+32); if(!b){mot_reply("err mem");return;}
+        int p=snprintf(b,32,"mem %x ",a);
+        for(int i=0;i<len;i++){uint8_t v=phys_readb(a+i); b[p++]=HEX[v>>4]; b[p++]=HEX[v&15];}
+        b[p]=0; mot_reply(b); free(b); return;
+    }
+    if (!strcmp(cmd,"find")) {               /* find <hexbytes> -> addrs in low mem */
+        char* sp=strtok(NULL," "); if(!sp){mot_reply("err args");return;}
+        int plen=(int)strlen(sp)/2; if(plen<2||plen>64){mot_reply("err patlen");return;}
+        uint8_t pat[64]; for(int i=0;i<plen;i++){char t[3]={sp[i*2],sp[i*2+1],0}; pat[i]=(uint8_t)strtoul(t,NULL,16);}
+        char b[256]; int p=snprintf(b,sizeof(b),"found");
+        uint32_t end=0xA0000u; int found=0;
+        for(uint32_t a=0x400;a+plen<end && found<8;a++){
+            int ok=1; for(int i=0;i<plen;i++) if(phys_readb(a+i)!=pat[i]){ok=0;break;}
+            if(ok){ p+=snprintf(b+p,sizeof(b)-p," %x",a); found++; a+=plen; }
+        }
+        if(!found) snprintf(b,sizeof(b),"found none");
+        mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"set-watch")) {   /* set-watch <lo> <hi> [r|w|rw][b] [val] */
+        char* a=strtok(NULL," ");char* h=strtok(NULL," ");char* d=strtok(NULL," ");char* v=strtok(NULL," ");
+        if(!a||!h){mot_reply("err args");return;}
+        if(mot_watch_n>=MOT_MAXW){mot_reply("err full");return;}
+        int rw=3; if(d){rw=0; if(strchr(d,'r'))rw|=1; if(strchr(d,'w'))rw|=2; if(!rw)rw=3;}
+        mot_watch[mot_watch_n].lo=(uint32_t)strtoul(a,NULL,16);
+        mot_watch[mot_watch_n].hi=(uint32_t)strtoul(h,NULL,16);
+        mot_watch[mot_watch_n].brk=(d && strchr(d,'b')) ? 1 : 0;
+        mot_watch[mot_watch_n].has_val=v ? 1 : 0;
+        mot_watch[mot_watch_n].val=v ? (uint32_t)strtoul(v,NULL,16) : 0;
+        mot_watch[mot_watch_n].rw=rw; mot_watch_n++;
+        if(mot_base==0) mot_base=(uint32_t)strtoul(a,NULL,16);
+        mot_update_hook(); mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"clear-watch")) { mot_watch_n=0; mot_update_hook(); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"trace-base")) { char* a=strtok(NULL," "); if(a)mot_base=(uint32_t)strtoul(a,NULL,16); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"trace-open")) {
+        char* path=strtok(NULL," "); if(!path){mot_reply("err args");return;}
+        if(mot_trace)fclose(mot_trace); mot_trace=fopen(path,"wb");
+        if(!mot_trace){mot_reply("err open");return;}
+        mot_w8('B'); mot_w32(mot_base); mot_w32(0); mot_update_hook(); mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"trace-close")) { if(mot_trace){fclose(mot_trace);mot_trace=NULL;} mot_update_hook(); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"flush")) { if(mot_trace)fflush(mot_trace); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"mark")) {
+        char* lbl=strtok(NULL,""); if(!lbl)lbl=(char*)"";
+        if(mot_trace){ mot_w8('M'); mot_w64((uint64_t)cycle_count);
+            int ll=(int)strlen(lbl); if(ll>255)ll=255; mot_w8((uint8_t)ll);
+            fwrite(lbl,1,ll,mot_trace);}
+        mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"hit")) {          /* last break-on-watch hit */
+        char b[160];
+        if(!mot_hit.valid) snprintf(b,sizeof(b),"hit none");
+        else snprintf(b,sizeof(b),"hit %s addr=%x size=%u val=%x at=%04x:%04x cyc=%llu",
+                      mot_hit.write?"W":"R",mot_hit.addr,(unsigned)mot_hit.size,mot_hit.val,
+                      mot_hit.cs,mot_hit.eip,(unsigned long long)mot_hit.cyc);
+        mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"file-log")) {     /* file-log [clear] -> lines, then '.' */
+        char* o=strtok(NULL," ");
+        if(o && !strcmp(o,"clear")){ mot_flog_n=0; mot_reply("ok"); return; }
+        for(int i=0;i<mot_flog_n;i++){ char b[128];
+            snprintf(b,sizeof(b),"%s pos=%x dest=%x n=%x cyc=%llu",mot_flog[i].name,
+                     mot_flog[i].pos,mot_flog[i].dest,mot_flog[i].n,(unsigned long long)mot_flog[i].cyc);
+            mot_reply(b); }
+        mot_reply("."); return;
+    }
+    if (!strcmp(cmd,"save-state")||!strcmp(cmd,"load-state")) {   /* <path> */
+        char* path=strtok(NULL," "); if(!path){mot_reply("err args");return;}
+        if(mot_in_gate){mot_reply("err not at a safe point (continue first)");return;}
+        extern bool use_save_file, noremark_save_state, force_load_state;
+        extern std::string savefilename;
+        bool uf=use_save_file; std::string sf=savefilename;
+        use_save_file=true; savefilename=path; noremark_save_state=true; force_load_state=true;
+        std::string err;
+        try {
+            if(cmd[0]=='s') SaveState::instance().save(0); else SaveState::instance().load(0);
+        } catch (const SaveState::Error& e) { err=e; }
+        use_save_file=uf; savefilename=sf;
+        if(!err.empty()){ std::string r="err "+err; mot_reply(r.c_str()); return; }
+        mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"set-bp")) {
+        char* sc=strtok(NULL," ");char* si=strtok(NULL," ");
+        if(!sc||!si){mot_reply("err args");return;}
+        if(mot_bp_n>=MOT_MAXBP){mot_reply("err full");return;}
+        mot_bp[mot_bp_n].cs=(uint16_t)strtoul(sc,NULL,16);
+        mot_bp[mot_bp_n].ip=(uint32_t)strtoul(si,NULL,16); mot_bp_n++;
+        mot_recompute_gate(); mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"clear-bp")) { mot_bp_n=0; mot_recompute_gate(); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"bp-status")) {
+        char b[96]; snprintf(b,sizeof(b),"bp hits=%lu last=%04x:%04x",mot_bp_hits,mot_bp_last_cs,mot_bp_last_ip);
+        mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"vinfo")) {
+        uint8_t mode=phys_readb(0x449); uint32_t page=phys_readw(0x44E);
+        char b[160]; int p=snprintf(b,sizeof(b),"vinfo mode=%02x cols=%d rows=%d page=%x phys=",
+            mode,(int)phys_readw(0x44A),(int)phys_readb(0x484)+1,page);
+        for(int i=0;i<8;i++){uint8_t v=phys_readb(0xB8000+page+i);b[p++]=HEX[v>>4];b[p++]=HEX[v&15];}
+        p+=snprintf(b+p,sizeof(b)-p," mem=");
+        for(int i=0;i<8;i++){uint8_t v=mem_readb_inline(0xB8000+page+i);b[p++]=HEX[v>>4];b[p++]=HEX[v&15];}
+        b[p]=0; mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"read-screen")) {
+        char* opt=strtok(NULL," "); int want_att = (opt && strstr(opt,"att"));
+        static char txt[132*60]; static uint8_t att[132*60]; int cols=0,rows=0;
+        if(!mot_screen(txt,att,&cols,&rows)){mot_reply("screen notext");return;}
+        char hdr[32]; snprintf(hdr,sizeof(hdr),"screen %d %d\n",cols,rows); mot_reply(hdr);
+        for(int r=0;r<rows;r++){ (void)!write(mot_cli_fd,&txt[r*cols],cols); (void)!write(mot_cli_fd,"\n",1); }
+        if(want_att){ (void)!write(mot_cli_fd,"attrs\n",6);
+            char* hl=(char*)malloc((size_t)cols*2+2);
+            for(int r=0;r<rows;r++){ int p=0; for(int c=0;c<cols;c++){uint8_t a=att[r*cols+c]; hl[p++]=HEX[a>>4]; hl[p++]=HEX[a&15];} hl[p++]='\n'; (void)!write(mot_cli_fd,hl,p);}
+            free(hl);
+        }
+        (void)!write(mot_cli_fd,".\n",2); return;
+    }
+    if (!strcmp(cmd,"send-keys")) {
+        char* tok; int n=0;
+        while((tok=strtok(NULL," "))){ uint16_t kc=mot_keycode(tok); if(kc){BIOS_AddKeyToBuffer(kc);n++;} }
+        char b[32]; snprintf(b,sizeof(b),"ok %d",n); mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"speed")) {
+        char* v=strtok(NULL," "); if(!v){char b[48];snprintf(b,sizeof(b),"speed %ld",(long)CPU_CycleMax);mot_reply(b);return;}
+        if(!strcasecmp(v,"max")) CPU_CycleMax=2000000; else { long c=atol(v); if(c>0)CPU_CycleMax=c; }
+        char b[48]; snprintf(b,sizeof(b),"ok speed %ld",(long)CPU_CycleMax); mot_reply(b); return;
+    }
+    if (!strcmp(cmd,"step")) {
+        char* n=strtok(NULL," "); long cnt=n?atol(n):1; if(cnt<1)cnt=1;
+        mot_step_budget=cnt; mot_mode=MOT_STEP; mot_recompute_gate(); mot_reply("ok"); return;
+    }
+    if (!strcmp(cmd,"continue")||!strcmp(cmd,"cont")) { mot_mode=MOT_RUN; mot_recompute_gate(); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"pause")) { mot_mode=MOT_PAUSED; mot_recompute_gate(); mot_reply("ok"); return; }
+    if (!strcmp(cmd,"wait")) {
+        if(mot_mode==MOT_PAUSED){char b[64];snprintf(b,sizeof(b),"paused %04x:%04x %llu",SegValue(cs),reg_ip,(unsigned long long)cycle_count);mot_reply(b);}
+        else mot_wait_pending=1;      /* answered when we next pause */
+        return;
+    }
+    if (!strcmp(cmd,"quit")) { mot_reply("bye"); if(mot_trace)fclose(mot_trace);
+        if(mot_cli_fd>=0)close(mot_cli_fd); if(mot_srv_fd>=0)close(mot_srv_fd);
+        _exit(0); }
+
+    mot_reply("err unknown");
+}
+
+/* Process one command line and, if a 'wait' is pending and we are now paused,
+ * answer it. */
+static void mot_dispatch(char* line) {
+    mot_cmd(line);
+    if (mot_wait_pending && mot_mode==MOT_PAUSED) {
+        char b[64]; snprintf(b,sizeof(b),"paused %04x:%04x %llu",
+                             SegValue(cs),reg_ip,(unsigned long long)cycle_count);
+        mot_reply(b); mot_wait_pending=0;
+    }
+}
+
+/* Block serving commands until a command resumes us (RUN/STEP) or the client
+ * disconnects.  Called from the per-instruction gate while paused: the CPU
+ * thread is frozen here, exactly like a debugger stop. */
+static void mot_serve_blocking(void) {
+    char line[4096];
+    while (mot_mode == MOT_PAUSED) {
+        if (mot_cli_fd < 0) { mot_mode = MOT_RUN; mot_recompute_gate(); return; }
+        if (mot_wait_pending) {           /* answer the wait that stopped us */
+            char b[64]; snprintf(b,sizeof(b),"paused %04x:%04x %llu",
+                                 SegValue(cs),reg_ip,(unsigned long long)cycle_count);
+            mot_reply(b); mot_wait_pending=0;
+        }
+        int n = mot_readline(line, sizeof(line));
+        if (n < 0) { close(mot_cli_fd); mot_cli_fd=-1; mot_mode=MOT_RUN; mot_recompute_gate(); return; }
+        mot_dispatch(line);
+    }
+}
+
+/* Per-instruction gate, called by the simple core when motrace_gate != 0,
+ * BEFORE the instruction at cs:reg_eip executes.  Freezes here while paused
+ * (serving the control channel) so a stop never busy-spins the core.  Always
+ * returns 1: the instruction executes after the gate releases. */
+int TRACE_StepGate(void) {
+    uint16_t csv = (uint16_t)SegValue(cs); uint32_t ip = reg_eip;
+    for (int i = 0; i < mot_bp_n; i++) if (mot_bp[i].cs==csv && mot_bp[i].ip==ip) {
+        mot_bp_hits++; mot_bp_last_cs=csv; mot_bp_last_ip=ip; mot_mode=MOT_PAUSED; break;
+    }
+    if (mot_mode == MOT_PAUSED) { mot_recompute_gate(); mot_in_gate=1; mot_serve_blocking(); mot_in_gate=0;
+        csv=(uint16_t)SegValue(cs); ip=reg_eip; }
+    if (mot_mode == MOT_STEP) {
+        if (mot_trace) {
+            mot_w8('S'); mot_w64((uint64_t)cycle_count); mot_w16(csv); mot_w32(ip);
+            mot_w32(reg_eax);mot_w32(reg_ebx);mot_w32(reg_ecx);mot_w32(reg_edx);
+            mot_w32(reg_esi);mot_w32(reg_edi);mot_w32(reg_ebp);mot_w32(reg_esp);
+            mot_w32(reg_flags);
+        }
+        if (--mot_step_budget <= 0) mot_mode = MOT_PAUSED;  /* pause after this instr */
+    }
+    mot_recompute_gate();
+    return 1;
+}
+
+/* Called from Normal_Loop (safe point).  Non-blocking in RUN mode: accept a
+ * client and drain any pending commands so you can set-watch / mark /
+ * read-screen / pause / step while the guest is running.  Actual pausing is
+ * enforced by the gate (above). */
+void TRACE_Poll(void) {
+    if (mot_enabled < 0) {
+        const char* sp = getenv("DOSBOX_CTLSOCK");
+        mot_enabled = 0;
+        if (sp && *sp) {
+            mot_srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (mot_srv_fd >= 0) {
+                struct sockaddr_un sa; memset(&sa,0,sizeof(sa)); sa.sun_family=AF_UNIX;
+                strncpy(sa.sun_path, sp, sizeof(sa.sun_path)-1);
+                unlink(sp);
+                if (bind(mot_srv_fd,(struct sockaddr*)&sa,sizeof(sa))==0 && listen(mot_srv_fd,1)==0) {
+                    int fl=fcntl(mot_srv_fd,F_GETFL,0); fcntl(mot_srv_fd,F_SETFL,fl|O_NONBLOCK);
+                    mot_enabled = 1;
+                    LOG_MSG("motrace: control socket at %s", sp);
+                } else { close(mot_srv_fd); mot_srv_fd=-1; }
+            }
+        }
+    }
+    if (mot_enabled != 1) return;
+
+    if (mot_cli_fd < 0) {                 /* try to accept (non-blocking) */
+        int fd = accept(mot_srv_fd, NULL, NULL);
+        if (fd < 0) return;               /* nobody yet; let guest run */
+        mot_cli_fd = fd; mot_rlen = 0;
+    }
+
+    char line[4096];
+    while (mot_has_data()) {
+        int n = mot_readline(line, sizeof(line));
+        if (n < 0) { close(mot_cli_fd); mot_cli_fd=-1; mot_mode=MOT_RUN; mot_recompute_gate(); return; }
+        mot_dispatch(line);
+    }
+    if (mot_mode == MOT_PAUSED) mot_serve_blocking();  /* paused with no gate? serve here */
+}
 
 /*! \brief          REDOS.COM utility command on drive Z: to trigger restart of the DOS kernel
  */

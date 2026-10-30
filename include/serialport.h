@@ -125,6 +125,9 @@ enum SerialTypesE {
 	SERIAL_TYPE_MODEM,
 	SERIAL_TYPE_NULL_MODEM,
 #endif
+#if !defined(WIN32)
+	SERIAL_TYPE_RIB,
+#endif
 	SERIAL_TYPE_COUNT
 };
 

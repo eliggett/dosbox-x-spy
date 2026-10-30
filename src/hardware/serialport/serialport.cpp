@@ -37,6 +37,7 @@
 #include "serialdummy.h"
 #include "softmodem.h"
 #include "nullmodem.h"
+#include "serialrib.h"
 #include "seriallog.h"
 #include "serialfile.h"
 
@@ -1444,6 +1445,18 @@ public:
 				}
 			}
 #endif
+#if !defined(WIN32)
+			else if(type=="rib") {
+				serialports[i] = new CSerialRIB (i, &cmd);
+				serialports[i]->serialType = SERIAL_TYPE_RIB;
+				serialports[i]->baud_multiplier = multiplier;
+				cmd.GetStringRemain(serialports[i]->commandLineString);
+				if (!serialports[i]->InstallationSuccessful)  {
+					delete serialports[i];
+					serialports[i] = NULL;
+				}
+			}
+#endif
 			else if(type=="disabled") {
 				serialports[i] = NULL;
 			} else {
@@ -1478,7 +1491,10 @@ static const char *serialTypes[SERIAL_TYPE_COUNT] = {
 #endif
 #if C_MODEM
 	"modem",
-	"nullmodem"
+	"nullmodem",
+#endif
+#if !defined(WIN32)
+	"rib",
 #endif
 };
 
@@ -1627,6 +1643,15 @@ void SERIAL::Run()
 				break;
 			case SERIAL_TYPE_NULL_MODEM:
 				serialports[port-1] = new CNullModem(port-1, &cmd);
+				if (!serialports[port-1]->InstallationSuccessful) {
+					delete serialports[port-1];
+					serialports[port-1] = NULL;
+				}
+				break;
+#endif
+#if !defined(WIN32)
+			case SERIAL_TYPE_RIB:
+				serialports[port-1] = new CSerialRIB(port-1, &cmd);
 				if (!serialports[port-1]->InstallationSuccessful) {
 					delete serialports[port-1];
 					serialports[port-1] = NULL;

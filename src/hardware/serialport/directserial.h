@@ -31,6 +31,7 @@
 #include "libserial.h"
 #include "pic.h"
 #include <deque>
+#include <vector>
 #include <utility>
 
 class CDirectSerial : public CSerial {
@@ -78,6 +79,12 @@ private:
 	std::deque<uint8_t> ribLocalEcho;
 	std::deque<std::pair<uint8_t, pic_tickindex_t>> ribHwEcho;
 	void ribDeliverEcho();
+	// With local echo, bytes are held and sent to the port together: the
+	// radio drops a message whose bytes are more than ~2 ms apart, and an
+	// emulator running slower than real time spreads them further.
+	std::vector<uint8_t> ribTx;
+	pic_tickindex_t ribTxLast = 0;
+	void ribFlush();
 
 #if SERIAL_DEBUG
 	bool dbgmsg_poll_block = false;

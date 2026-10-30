@@ -18,6 +18,7 @@
 
 
 #include <limits>
+#include <time.h>
 
 #include "dosbox.h"
 
@@ -197,6 +198,9 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 					break;
 			}
 			ribDeliverEcho();
+			// anything shorter than a message goes out once the program pauses
+			if(!ribTx.empty() && PIC_FullIndex() - ribTxLast > 2 * bytetime)
+				ribFlush();
 			updateMSR();
 			break;
 		}
@@ -387,10 +391,26 @@ void CDirectSerial::ribSetDTR(bool val) {
 	updateMSR();
 }
 
+void CDirectSerial::ribFlush() {
+	for(uint8_t b : ribTx)
+		if(!SERIAL_sendchar(comport, (char)b))
+			LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
+	ribTx.clear();
+}
+
 void CDirectSerial::transmitByte (uint8_t val, bool first) {
-	if(!SERIAL_sendchar(comport, (char)val))
+	if(rib && ribEcho) {
+		ribTx.push_back(val);
+		ribTxLast = PIC_FullIndex();
+		if(ribTx.size() >= 5) ribFlush();	// one SB9600 message
+	} else if(!SERIAL_sendchar(comport, (char)val))
 		LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
-	if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f tx %02x", (double)PIC_FullIndex(), val);
+	if(getenv("MOT_RIBDEBUG")) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		LOG_MSG("RIB %.3f tx %02x wall %.3f", (double)PIC_FullIndex(), val,
+			(double)(ts.tv_sec % 1000) * 1000.0 + ts.tv_nsec / 1e6);
+	}
 	if(rib && ribEcho) {
 		ribLocalEcho.push_back(val);
 		ribHwEcho.push_back(std::make_pair(val, PIC_FullIndex()));

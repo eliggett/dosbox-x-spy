@@ -29,6 +29,9 @@
 #include "serialport.h"
 
 #include "libserial.h"
+#include "pic.h"
+#include <deque>
+#include <utility>
 
 class CDirectSerial : public CSerial {
 public:
@@ -58,6 +61,23 @@ private:
 	Bitu rx_retry_max;	// how many POLL_EVENTS to wait before causing
 						// an overrun error.
 	bool doReceive();
+
+	// rib:1 - a Motorola RIB cable: DTR is the bus BUSY output and BUSY comes
+	// back on CTS/RI. Programs like Motorola RSS drop DTR and expect RI to
+	// follow within about a millisecond, faster than USB adapters report it.
+	bool rib = false;
+	bool ribDtr = false;
+	double ribHoldoff = 30.0;		// ms to ignore the hardware BUSY after a DTR change
+	pic_tickindex_t ribDtrChanged = 0;
+	void ribSetDTR(bool val);
+	// ribecho (default on with rib:1): the bus echoes every byte, and RSS
+	// allows ~20 ms for it, less than a USB adapter's round trip may take.
+	// Echo locally at once and drop the hardware copy when it arrives; a
+	// hardware byte that differs is passed on, so collisions still show.
+	bool ribEcho = true;
+	std::deque<uint8_t> ribLocalEcho;
+	std::deque<std::pair<uint8_t, pic_tickindex_t>> ribHwEcho;
+	void ribDeliverEcho();
 
 #if SERIAL_DEBUG
 	bool dbgmsg_poll_block = false;

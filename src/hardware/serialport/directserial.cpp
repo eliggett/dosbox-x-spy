@@ -58,10 +58,27 @@ CDirectSerial::CDirectSerial (Bitu id, CommandLine* cmd)
 
 	// rxdelay: How many milliseconds to wait before causing an
 	// overflow when the application is unresponsive.
-	if(getBituSubstring("rxdelay:", &rx_retry_max, cmd)) {
+	bool rxdelay_set = getBituSubstring("rxdelay:", &rx_retry_max, cmd);
+	if(rxdelay_set) {
 		if(!(rx_retry_max<=10000)) {
 			rx_retry_max=0;
 		}
+	}
+
+	// rib:1 - see directserial.h. ribholdoff: ms (default 30).
+	if(cmd->FindStringBegin("rib:",tmpstring,false) && tmpstring!="0") {
+		rib = true;
+		if(cmd->FindStringBegin("ribholdoff:",tmpstring,false))
+			ribHoldoff = atof(tmpstring.c_str());
+		if(cmd->FindStringBegin("ribecho:",tmpstring,false))
+			ribEcho = tmpstring!="0";
+		// RSS polls the UART between delay loops; an echo and a reply arriving
+		// together overrun it unless received bytes are held for a while.
+		if(!rxdelay_set) rx_retry_max = 50;
+		bool lowlat = SERIAL_setLowLatency(comport);
+		LOG_MSG("Serial%d: RIB mode, BUSY hold-off %g ms, rxdelay %d ms%s%s",
+			(int)(COMNUMBER), ribHoldoff, (int)rx_retry_max,
+			ribEcho ? ", local echo" : "", lowlat ? ", low-latency port" : "");
 	}
 
 	CSerial::Init_Registers();
@@ -179,6 +196,7 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 				case D_RX_FASTWAIT:
 					break;
 			}
+			ribDeliverEcho();
 			updateMSR();
 			break;
 		}
@@ -232,6 +250,7 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 			break;
 		}
 		case SERIAL_TX_EVENT: {
+			ribDeliverEcho();
 			// Maybe echo circuit works a bit better this way
 			if(rx_state==D_RX_IDLE && CanReceiveByte()) {
 				if(doReceive()) {
@@ -269,12 +288,36 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 }
 
 bool CDirectSerial::doReceive() {
-	int value = SERIAL_getextchar(comport);
-	if(value) {
-		receiveByteEx((uint8_t)(value&0xff),(uint8_t)((value&0xff00)>>8));
+	int value;
+	while((value = SERIAL_getextchar(comport))) {
+		uint8_t data = (uint8_t)(value&0xff);
+		uint8_t error = (uint8_t)((value&0xff00)>>8);
+		// expected hardware echoes older than this never came
+		while(!ribHwEcho.empty() && PIC_FullIndex() - ribHwEcho.front().second > 250.0)
+			ribHwEcho.pop_front();
+		if(!ribHwEcho.empty()) {
+			uint8_t want = ribHwEcho.front().first;
+			ribHwEcho.pop_front();
+			if(data == want && !error) {			// already echoed locally
+				if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f hw echo %02x dropped", (double)PIC_FullIndex(), data);
+				continue;
+			}
+			if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f hw %02x != echo %02x", (double)PIC_FullIndex(), data, want);
+			ribHwEcho.clear();						// collision: pass it on
+		}
+		if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f rx %02x canrx=%d", (double)PIC_FullIndex(), data, (int)CanReceiveByte());
+		receiveByteEx(data, error);
 		return true;
 	}
 	return false;
+}
+
+void CDirectSerial::ribDeliverEcho() {
+	if(!ribLocalEcho.empty() && CanReceiveByte()) {
+		if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f local echo %02x", (double)PIC_FullIndex(), ribLocalEcho.front());
+		receiveByte(ribLocalEcho.front());
+		ribLocalEcho.pop_front();
+	}
 }
 
 // updatePortConfig is called when emulated app changes the serial port
@@ -319,15 +362,39 @@ void CDirectSerial::updatePortConfig(double baudrate, uint8_t lcr) {
 void CDirectSerial::updateMSR () {
 	int new_status = SERIAL_getmodemstatus(comport);
 
-	setCTS((new_status&SERIAL_CTS)? true:false);
+	if (rib) {
+		// BUSY is wired-OR: our own DTR, or another device on the bus. Right
+		// after a DTR change the hardware lines still show the old state, so
+		// trust only DTR until they have had time to settle.
+		bool busy = ribDtr;
+		if (PIC_FullIndex() - ribDtrChanged >= ribHoldoff)
+			busy = busy || (new_status & (SERIAL_CTS | SERIAL_RI));
+		setCTS(busy);
+		setRI(busy);
+	} else {
+		setCTS((new_status&SERIAL_CTS)? true:false);
+		setRI((new_status&SERIAL_RI)? true:false);
+	}
 	setDSR((new_status&SERIAL_DSR)? true:false);
-	setRI((new_status&SERIAL_RI)? true:false);
 	setCD((new_status&SERIAL_CD)? true:false);
+}
+
+void CDirectSerial::ribSetDTR(bool val) {
+	if (val != ribDtr) {
+		ribDtr = val;
+		ribDtrChanged = PIC_FullIndex();
+	}
+	updateMSR();
 }
 
 void CDirectSerial::transmitByte (uint8_t val, bool first) {
 	if(!SERIAL_sendchar(comport, (char)val))
 		LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
+	if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f tx %02x", (double)PIC_FullIndex(), val);
+	if(rib && ribEcho) {
+		ribLocalEcho.push_back(val);
+		ribHwEcho.push_back(std::make_pair(val, PIC_FullIndex()));
+	}
 	if(first) setEvent(SERIAL_THR_EVENT, bytetime/8);
 	else setEvent(SERIAL_TX_EVENT, bytetime);
 }
@@ -342,6 +409,7 @@ void CDirectSerial::setBreak (bool value) {
 void CDirectSerial::setRTSDTR(bool rts, bool dtr) {
 	SERIAL_setRTS(comport,rts);
 	SERIAL_setDTR(comport,dtr);
+	if (rib) ribSetDTR(dtr);
 }
 
 void CDirectSerial::setRTS(bool val) {
@@ -350,6 +418,7 @@ void CDirectSerial::setRTS(bool val) {
 
 void CDirectSerial::setDTR(bool val) {
 	SERIAL_setDTR(comport,val);
+	if (rib) ribSetDTR(val);
 }
 
 #endif

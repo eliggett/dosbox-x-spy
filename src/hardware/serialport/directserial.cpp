@@ -64,6 +64,16 @@ CDirectSerial::CDirectSerial (Bitu id, CommandLine* cmd)
 		}
 	}
 
+	// lowlatency:1 - ask the host driver to pass received bytes and modem
+	// line changes on at once. A USB adapter otherwise holds them for its
+	// latency timer (FTDI: 16 ms).
+	if(cmd->FindStringBegin("lowlatency:",tmpstring,false) && tmpstring!="0") {
+		if(SERIAL_setLowLatency(comport))
+			LOG_MSG("Serial%d: low-latency mode on", (int)(COMNUMBER));
+		else
+			LOG_MSG("Serial%d: low-latency mode not supported by this port or host", (int)(COMNUMBER));
+	}
+
 	CSerial::Init_Registers();
 	InstallationSuccessful = true;
 	rx_state = D_RX_IDLE;

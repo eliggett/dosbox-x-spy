@@ -222,6 +222,13 @@ static void serial_set_break_platform(COMPORT port, bool value) {
 	port->breakstatus = value;
 }
 
+// Ask the driver to pass data and line changes on at once (no-op here).
+static bool serial_set_low_latency_platform(COMPORT port) {
+	(void)port;
+	return false;
+}
+
+
 static int serial_get_modem_status_platform(COMPORT port) {
 	DWORD retval = 0;
 	GetCommModemStatus (port->porthandle, &retval);
@@ -310,6 +317,10 @@ static bool serial_set_comm_parameters_platform(COMPORT port,
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h> // sprintf
+
+#if defined(LINUX)
+#include <linux/serial.h> // serial_struct, ASYNC_LOW_LATENCY
+#endif
 
 #ifndef CMSPAR
 // Mark or space parity bit.
@@ -415,6 +426,22 @@ static void serial_get_error_string_platform(char* buffer, size_t length) {
 	sprintf(buffer + sysmsg_offset, "System error %d.",error);
 	
 }
+
+// Ask the driver to pass data and line changes on at once: on Linux
+// ASYNC_LOW_LATENCY (USB adapters such as FTDI then report every 1 ms
+// instead of every 16 ms). Best effort; false where unsupported.
+static bool serial_set_low_latency_platform(COMPORT port) {
+#if defined(LINUX)
+	struct serial_struct ss;
+	if (ioctl(port->porthandle, TIOCGSERIAL, &ss) == -1) return false;
+	ss.flags |= ASYNC_LOW_LATENCY;
+	return ioctl(port->porthandle, TIOCSSERIAL, &ss) != -1;
+#else
+	(void)port;
+	return false;
+#endif
+}
+
 
 static int serial_get_modem_status_platform(COMPORT port) {
 	long flags = 0;
@@ -684,6 +711,13 @@ static int serial_get_ext_char_platform(COMPORT port) {
 }
 
 
+// Ask the driver to pass data and line changes on at once (no-op here).
+static bool serial_set_low_latency_platform(COMPORT port) {
+	(void)port;
+	return false;
+}
+
+
 static int serial_get_modem_status_platform(COMPORT port) {
 	UCHAR dptr = 0;
 	ULONG ulParmLen = sizeof(dptr);
@@ -812,6 +846,10 @@ void SERIAL_setBREAK(COMPORT port, bool value) {
 
 int SERIAL_getmodemstatus(COMPORT port) {
 	return serial_get_modem_status_platform(port);
+}
+
+bool SERIAL_setLowLatency(COMPORT port) {
+	return serial_set_low_latency_platform(port);
 }
 
 bool SERIAL_sendchar(COMPORT port, char data) {

@@ -58,16 +58,36 @@ CDirectSerial::CDirectSerial (Bitu id, CommandLine* cmd)
 
 	// rxdelay: How many milliseconds to wait before causing an
 	// overflow when the application is unresponsive.
-	if(getBituSubstring("rxdelay:", &rx_retry_max, cmd)) {
+	bool rxdelay_set = getBituSubstring("rxdelay:", &rx_retry_max, cmd);
+	if(rxdelay_set) {
 		if(!(rx_retry_max<=10000)) {
 			rx_retry_max=0;
 		}
 	}
 
-	// lowlatency:1 - ask the host driver to pass received bytes and modem
-	// line changes on at once. A USB adapter otherwise holds them for its
-	// latency timer (FTDI: 16 ms).
-	if(cmd->FindStringBegin("lowlatency:",tmpstring,false) && tmpstring!="0") {
+	// rib:1 - a Motorola RIB cable, see directserial.h. ribholdoff: ms
+	// (default 30), ribecho:0 to turn the local echo off.
+	if(cmd->FindStringBegin("rib:",tmpstring,false) && tmpstring!="0") {
+		rib = true;
+		if(getBituSubstring("ribholdoff:", &ribHoldoff, cmd) && ribHoldoff > 1000)
+			ribHoldoff = 1000;
+		if(cmd->FindStringBegin("ribecho:",tmpstring,false))
+			ribEcho = tmpstring!="0";
+		// RSS polls the UART between delay loops; an echo and a reply arriving
+		// together overrun it unless received bytes are held for a while.
+		if(!rxdelay_set) rx_retry_max = 50;
+		LOG_MSG("Serial%d: RIB mode, BUSY hold-off %d ms, rxdelay %d ms%s",
+			(int)(COMNUMBER), (int)ribHoldoff, (int)rx_retry_max,
+			ribEcho ? ", local echo" : "");
+	}
+
+	// lowlatency:1 (the default with rib:1) - ask the host driver to pass
+	// received bytes and modem line changes on at once. A USB adapter
+	// otherwise holds them for its latency timer (FTDI: 16 ms).
+	bool lowlatency = rib;
+	if(cmd->FindStringBegin("lowlatency:",tmpstring,false))
+		lowlatency = tmpstring!="0";
+	if(lowlatency) {
 		if(SERIAL_setLowLatency(comport))
 			LOG_MSG("Serial%d: low-latency mode on", (int)(COMNUMBER));
 		else
@@ -189,6 +209,10 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 				case D_RX_FASTWAIT:
 					break;
 			}
+			ribDeliverEcho();
+			// anything shorter than a message goes out once the program pauses
+			if(!ribTx.empty() && PIC_FullIndex() - ribTxLast > 2 * bytetime)
+				ribFlush();
 			updateMSR();
 			break;
 		}
@@ -242,6 +266,7 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 			break;
 		}
 		case SERIAL_TX_EVENT: {
+			ribDeliverEcho();
 			// Maybe echo circuit works a bit better this way
 			if(rx_state==D_RX_IDLE && CanReceiveByte()) {
 				if(doReceive()) {
@@ -279,12 +304,40 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 }
 
 bool CDirectSerial::doReceive() {
-	int value = SERIAL_getextchar(comport);
-	if(value) {
-		receiveByteEx((uint8_t)(value&0xff),(uint8_t)((value&0xff00)>>8));
+	int value;
+	while((value = SERIAL_getextchar(comport))) {
+		uint8_t data = (uint8_t)(value&0xff);
+		uint8_t error = (uint8_t)((value&0xff00)>>8);
+		while(!ribHwEcho.empty() && PIC_FullIndex() - ribHwEcho.front().second > RIB_HW_ECHO_TIMEOUT)
+			ribHwEcho.pop_front();
+		if(!ribHwEcho.empty()) {
+			uint8_t want = ribHwEcho.front().first;
+			ribHwEcho.pop_front();
+			if(data == want && !error) {			// already echoed locally
+#if SERIAL_DEBUG
+				log_ser(dbg_aux,"Directserial: RIB hardware echo 0x%02x dropped", data);
+#endif
+				continue;
+			}
+#if SERIAL_DEBUG
+			log_ser(dbg_aux,"Directserial: RIB received 0x%02x, expected echo 0x%02x", data, want);
+#endif
+			ribHwEcho.clear();						// collision: pass it on
+		}
+		receiveByteEx(data, error);
 		return true;
 	}
 	return false;
+}
+
+void CDirectSerial::ribDeliverEcho() {
+	if(!ribLocalEcho.empty() && CanReceiveByte()) {
+#if SERIAL_DEBUG
+		log_ser(dbg_aux,"Directserial: RIB local echo 0x%02x", ribLocalEcho.front());
+#endif
+		receiveByte(ribLocalEcho.front());
+		ribLocalEcho.pop_front();
+	}
 }
 
 // updatePortConfig is called when emulated app changes the serial port
@@ -329,14 +382,46 @@ void CDirectSerial::updatePortConfig(double baudrate, uint8_t lcr) {
 void CDirectSerial::updateMSR () {
 	int new_status = SERIAL_getmodemstatus(comport);
 
-	setCTS((new_status&SERIAL_CTS)? true:false);
+	if (rib) {
+		// BUSY is wired-OR: our own DTR, or another device on the bus. Right
+		// after a DTR change the hardware lines still show the old state, so
+		// trust only DTR until they have had time to settle.
+		bool busy = ribDtr;
+		if (PIC_FullIndex() - ribDtrChanged >= ribHoldoff)
+			busy = busy || (new_status & (SERIAL_CTS | SERIAL_RI));
+		setCTS(busy);
+		setRI(busy);
+	} else {
+		setCTS((new_status&SERIAL_CTS)? true:false);
+		setRI((new_status&SERIAL_RI)? true:false);
+	}
 	setDSR((new_status&SERIAL_DSR)? true:false);
-	setRI((new_status&SERIAL_RI)? true:false);
 	setCD((new_status&SERIAL_CD)? true:false);
 }
 
+void CDirectSerial::ribSetDTR(bool val) {
+	if (val != ribDtr) {
+		ribDtr = val;
+		ribDtrChanged = PIC_FullIndex();
+	}
+	updateMSR();
+}
+
+void CDirectSerial::ribFlush() {
+	for(uint8_t b : ribTx)
+		if(!SERIAL_sendchar(comport, (char)b))
+			LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
+	ribTx.clear();
+}
+
 void CDirectSerial::transmitByte (uint8_t val, bool first) {
-	if(!SERIAL_sendchar(comport, (char)val))
+	if(rib && ribEcho) {
+		ribTx.push_back(val);
+		ribTxLast = PIC_FullIndex();
+		if(ribTx.size() >= RIB_MESSAGE_LEN) ribFlush();
+		ribLocalEcho.push_back(val);
+		ribHwEcho.push_back(std::make_pair(val, PIC_FullIndex()));
+	} else if(!SERIAL_sendchar(comport, (char)val))
 		LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
 	if(first) setEvent(SERIAL_THR_EVENT, bytetime/8);
 	else setEvent(SERIAL_TX_EVENT, bytetime);
@@ -352,6 +437,7 @@ void CDirectSerial::setBreak (bool value) {
 void CDirectSerial::setRTSDTR(bool rts, bool dtr) {
 	SERIAL_setRTS(comport,rts);
 	SERIAL_setDTR(comport,dtr);
+	if (rib) ribSetDTR(dtr);
 }
 
 void CDirectSerial::setRTS(bool val) {
@@ -360,6 +446,7 @@ void CDirectSerial::setRTS(bool val) {
 
 void CDirectSerial::setDTR(bool val) {
 	SERIAL_setDTR(comport,val);
+	if (rib) ribSetDTR(val);
 }
 
 #endif

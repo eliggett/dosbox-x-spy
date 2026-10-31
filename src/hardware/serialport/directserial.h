@@ -67,10 +67,24 @@ private:
 	// back on CTS/RI. Programs like Motorola RSS drop DTR and expect RI to
 	// follow within about a millisecond, faster than USB adapters report it.
 	bool rib = false;
+	bool ribDebug = false, ribDbgHw = false, ribDbgBusy = false;	// MOT_RIBDEBUG
 	bool ribDtr = false;
 	double ribHoldoff = 30.0;		// ms to ignore the hardware BUSY after a DTR change
 	pic_tickindex_t ribDtrChanged = 0;
+	// After we drop DTR the hardware BUSY lags for a few ms; once it reads
+	// clear, BUSY is another device (a radio in test mode talks on its own
+	// a few ms after a command), so the hold-off ends there.
+	bool ribHwSettled = true;
+	bool ribHwBusy = false;			// hardware BUSY seen since DTR went up
+	pic_tickindex_t ribForeignRx = -1000.0;	// last byte from another device
+	bool ribBusyOut();
 	void ribSetDTR(bool val);
+	bool ribPortDtr = false;		// the port's DTR (BUSY out)
+	pic_tickindex_t ribTxDone = 0;	// when the bytes sent will have left the port
+	void ribPortDtrDown();
+	// Bytes another device sent while the program wasn't listening; dropped
+	// when the program starts its next message, as a UART's overrun would.
+	void ribDrainRx();
 	// ribecho (default on with rib:1): the bus echoes every byte, and RSS
 	// allows ~20 ms for it, less than a USB adapter's round trip may take.
 	// Echo locally at once and drop the hardware copy when it arrives; a
@@ -79,9 +93,13 @@ private:
 	std::deque<uint8_t> ribLocalEcho;
 	std::deque<std::pair<uint8_t, pic_tickindex_t>> ribHwEcho;
 	void ribDeliverEcho();
-	// With local echo, bytes are held and sent to the port together: the
-	// radio drops a message whose bytes are more than ~2 ms apart, and an
-	// emulator running slower than real time spreads them further.
+	// With local echo, bytes wait in ribTx until our BUSY is on the bus,
+	// then (ribburst:1, the default) go to the port 5 at a time, one SB9600
+	// message: the radio drops a message whose bytes are more than ~2 ms
+	// apart, and one write per byte through a USB adapter goes out on its
+	// 1 ms frame schedule, which can spread them that far. ribburst:0
+	// sends each byte at once.
+	bool ribBurst = true;
 	std::vector<uint8_t> ribTx;
 	pic_tickindex_t ribTxLast = 0;
 	void ribFlush();

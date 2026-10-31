@@ -69,17 +69,24 @@ CDirectSerial::CDirectSerial (Bitu id, CommandLine* cmd)
 	// rib:1 - see directserial.h. ribholdoff: ms (default 30).
 	if(cmd->FindStringBegin("rib:",tmpstring,false) && tmpstring!="0") {
 		rib = true;
+		ribDebug = getenv("MOT_RIBDEBUG") != NULL;
 		if(cmd->FindStringBegin("ribholdoff:",tmpstring,false))
 			ribHoldoff = atof(tmpstring.c_str());
 		if(cmd->FindStringBegin("ribecho:",tmpstring,false))
 			ribEcho = tmpstring!="0";
+		if(cmd->FindStringBegin("ribburst:",tmpstring,false))
+			ribBurst = tmpstring!="0";
 		// RSS polls the UART between delay loops; an echo and a reply arriving
 		// together overrun it unless received bytes are held for a while.
 		if(!rxdelay_set) rx_retry_max = 50;
+		// opening the port raised DTR; BUSY starts released
+		SERIAL_setDTR(comport, false);
+		ribPortDtr = false;
 		bool lowlat = SERIAL_setLowLatency(comport);
-		LOG_MSG("Serial%d: RIB mode, BUSY hold-off %g ms, rxdelay %d ms%s%s",
+		LOG_MSG("Serial%d: RIB mode, BUSY hold-off %g ms, rxdelay %d ms%s%s%s",
 			(int)(COMNUMBER), ribHoldoff, (int)rx_retry_max,
-			ribEcho ? ", local echo" : "", lowlat ? ", low-latency port" : "");
+			ribEcho ? ", local echo" : "", ribEcho && ribBurst ? ", burst" : "",
+			lowlat ? ", low-latency port" : "");
 	}
 
 	CSerial::Init_Registers();
@@ -199,8 +206,10 @@ void CDirectSerial::handleUpperEvent(uint16_t type) {
 			}
 			ribDeliverEcho();
 			// anything shorter than a message goes out once the program pauses
-			if(!ribTx.empty() && PIC_FullIndex() - ribTxLast > 2 * bytetime)
+			if(!ribTx.empty() && ribBusyOut() && (!ribBurst ||
+				PIC_FullIndex() - ribTxLast > 2 * bytetime))
 				ribFlush();
+			if(rib) ribPortDtrDown();
 			updateMSR();
 			break;
 		}
@@ -303,13 +312,19 @@ bool CDirectSerial::doReceive() {
 			uint8_t want = ribHwEcho.front().first;
 			ribHwEcho.pop_front();
 			if(data == want && !error) {			// already echoed locally
-				if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f hw echo %02x dropped", (double)PIC_FullIndex(), data);
+				if(ribDebug) LOG_MSG("RIB %.3f hw echo %02x dropped", (double)PIC_FullIndex(), data);
 				continue;
 			}
-			if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f hw %02x != echo %02x", (double)PIC_FullIndex(), data, want);
+			if(ribDebug) LOG_MSG("RIB %.3f hw %02x != echo %02x", (double)PIC_FullIndex(), data, want);
 			ribHwEcho.clear();						// collision: pass it on
 		}
-		if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f rx %02x canrx=%d", (double)PIC_FullIndex(), data, (int)CanReceiveByte());
+		if(rib && !ribDtr) {
+			// another device talking while we don't hold the bus: the BUSY
+			// the hardware shows is theirs
+			ribHwSettled = true;
+			ribForeignRx = PIC_FullIndex();
+		}
+		if(ribDebug) LOG_MSG("RIB %.3f rx %02x canrx=%d", (double)PIC_FullIndex(), data, (int)CanReceiveByte());
 		receiveByteEx(data, error);
 		return true;
 	}
@@ -318,7 +333,7 @@ bool CDirectSerial::doReceive() {
 
 void CDirectSerial::ribDeliverEcho() {
 	if(!ribLocalEcho.empty() && CanReceiveByte()) {
-		if(getenv("MOT_RIBDEBUG")) LOG_MSG("RIB %.3f local echo %02x", (double)PIC_FullIndex(), ribLocalEcho.front());
+		if(ribDebug) LOG_MSG("RIB %.3f local echo %02x", (double)PIC_FullIndex(), ribLocalEcho.front());
 		receiveByte(ribLocalEcho.front());
 		ribLocalEcho.pop_front();
 	}
@@ -370,11 +385,24 @@ void CDirectSerial::updateMSR () {
 		// BUSY is wired-OR: our own DTR, or another device on the bus. Right
 		// after a DTR change the hardware lines still show the old state, so
 		// trust only DTR until they have had time to settle.
-		bool busy = ribDtr;
-		if (PIC_FullIndex() - ribDtrChanged >= ribHoldoff)
-			busy = busy || (new_status & (SERIAL_CTS | SERIAL_RI));
+		bool hw = (new_status & (SERIAL_CTS | SERIAL_RI)) != 0;
+		if (ribDtr && hw) ribHwBusy = true;
+		if (!ribDtr && !ribHwSettled &&
+			(!hw || PIC_FullIndex() - ribDtrChanged >= ribHoldoff))
+			ribHwSettled = true;
+		// bytes from another device mean the bus is busy, even before the
+		// adapter reports the line
+		bool busy = ribDtr || (ribHwSettled && hw) ||
+			PIC_FullIndex() - ribForeignRx < 2 * bytetime;
+		if (ribDebug && (hw != ribDbgHw || busy != ribDbgBusy)) {
+			LOG_MSG("RIB %.3f line hw %d busy %d dtr %d settled %d", (double)PIC_FullIndex(),
+				(int)hw, (int)busy, (int)ribDtr, (int)ribHwSettled);
+			ribDbgHw = hw;
+			ribDbgBusy = busy;
+		}
 		setCTS(busy);
 		setRI(busy);
+		if (!ribTx.empty() && !ribBurst && ribBusyOut()) ribFlush();
 	} else {
 		setCTS((new_status&SERIAL_CTS)? true:false);
 		setRI((new_status&SERIAL_RI)? true:false);
@@ -383,15 +411,75 @@ void CDirectSerial::updateMSR () {
 	setCD((new_status&SERIAL_CD)? true:false);
 }
 
+// The program's DTR. The port's DTR follows it, but goes down only once
+// the bytes sent have left the port: with local echo the program is done
+// with a message before its bytes are on the bus, and BUSY must stay up
+// until the end of the message.
 void CDirectSerial::ribSetDTR(bool val) {
+	if (val && !ribPortDtr) {
+		SERIAL_setDTR(comport, true);
+		ribPortDtr = true;
+	}
 	if (val != ribDtr) {
 		ribDtr = val;
 		ribDtrChanged = PIC_FullIndex();
+		ribHwSettled = false;
+		ribHwBusy = false;
+		if (val) {
+			// bytes of a message the program gave up on never go out
+			if (!ribTx.empty()) {
+				if (ribDebug) LOG_MSG("RIB %.3f %d unsent bytes dropped", (double)PIC_FullIndex(), (int)ribTx.size());
+				for (size_t i = 0; i < ribTx.size() && !ribHwEcho.empty(); i++)
+					ribHwEcho.pop_back();
+				ribTx.clear();
+			}
+			ribDrainRx();
+		}
 	}
 	updateMSR();
+	if (!ribTx.empty() && !ribBurst && ribBusyOut()) ribFlush();
+	ribPortDtrDown();
+}
+
+void CDirectSerial::ribPortDtrDown() {
+	if (ribPortDtr && !ribDtr && ribTx.empty() &&
+		PIC_FullIndex() >= ribTxDone + bytetime) {
+		SERIAL_setDTR(comport, false);
+		ribPortDtr = false;
+	}
+}
+
+// Our BUSY is on the bus: the hardware shows it, or it has had time to. DTR
+// is set through a different path than the data (a USB control request), so
+// a byte sent right after raising DTR can reach the bus before BUSY does.
+bool CDirectSerial::ribBusyOut() {
+	return !ribDtr || ribHwBusy || PIC_FullIndex() - ribDtrChanged >= 3.0;
+}
+
+void CDirectSerial::ribDrainRx() {
+	int value;
+	while((value = SERIAL_getextchar(comport))) {
+		uint8_t data = (uint8_t)(value & 0xff);
+		// the end of our last message may still be echoing back
+		if(!ribHwEcho.empty() && ribHwEcho.front().first == data && !(value & 0xff00)) {
+			ribHwEcho.pop_front();
+			if(ribDebug) LOG_MSG("RIB %.3f hw echo %02x dropped", (double)PIC_FullIndex(), data);
+			continue;
+		}
+		if(ribDebug) LOG_MSG("RIB %.3f stale %02x dropped", (double)PIC_FullIndex(), data);
+	}
 }
 
 void CDirectSerial::ribFlush() {
+	// when these bytes will have left the port
+	ribTxDone = std::max<pic_tickindex_t>(ribTxDone, PIC_FullIndex()) +
+		(pic_tickindex_t)ribTx.size() * bytetime;
+	if (ribDebug) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		LOG_MSG("RIB %.3f flush %d wall %.3f", (double)PIC_FullIndex(), (int)ribTx.size(),
+			(double)(ts.tv_sec % 1000) * 1000.0 + ts.tv_nsec / 1e6);
+	}
 	for(uint8_t b : ribTx)
 		if(!SERIAL_sendchar(comport, (char)b))
 			LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
@@ -402,10 +490,10 @@ void CDirectSerial::transmitByte (uint8_t val, bool first) {
 	if(rib && ribEcho) {
 		ribTx.push_back(val);
 		ribTxLast = PIC_FullIndex();
-		if(ribTx.size() >= 5) ribFlush();	// one SB9600 message
+		if(ribBusyOut() && (!ribBurst || ribTx.size() >= 5)) ribFlush();
 	} else if(!SERIAL_sendchar(comport, (char)val))
 		LOG_MSG("Serial%d: COM port error: write failed!", (int)COMNUMBER);
-	if(getenv("MOT_RIBDEBUG")) {
+	if(ribDebug) {
 		struct timespec ts;
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		LOG_MSG("RIB %.3f tx %02x wall %.3f", (double)PIC_FullIndex(), val,
@@ -428,8 +516,8 @@ void CDirectSerial::setBreak (bool value) {
 // updateModemControlLines(mcr) sets DTR and RTS. 
 void CDirectSerial::setRTSDTR(bool rts, bool dtr) {
 	SERIAL_setRTS(comport,rts);
-	SERIAL_setDTR(comport,dtr);
 	if (rib) ribSetDTR(dtr);
+	else SERIAL_setDTR(comport,dtr);
 }
 
 void CDirectSerial::setRTS(bool val) {
@@ -437,8 +525,8 @@ void CDirectSerial::setRTS(bool val) {
 }
 
 void CDirectSerial::setDTR(bool val) {
-	SERIAL_setDTR(comport,val);
 	if (rib) ribSetDTR(val);
+	else SERIAL_setDTR(comport,val);
 }
 
 #endif

@@ -29,6 +29,10 @@
 #include "serialport.h"
 
 #include "libserial.h"
+#include "pic.h"
+#include <deque>
+#include <vector>
+#include <utility>
 
 class CDirectSerial : public CSerial {
 public:
@@ -58,6 +62,35 @@ private:
 	Bitu rx_retry_max;	// how many POLL_EVENTS to wait before causing
 						// an overrun error.
 	bool doReceive();
+
+	// rib:1 - a Motorola RIB (Radio Interface Box) cable to an SB9600 bus, as
+	// used by Motorola's DOS radio programming software (RSS). DTR drives the
+	// bus BUSY line and BUSY comes back on CTS/RI. RSS raises and drops DTR
+	// and expects RI to follow within about a millisecond, faster than a USB
+	// adapter reports it.
+	bool rib = false;
+	bool ribDtr = false;
+	Bitu ribHoldoff = 30;			// ms to ignore the hardware BUSY after a DTR change
+	pic_tickindex_t ribDtrChanged = 0;
+	void ribSetDTR(bool val);
+	// ribecho:1 (the default with rib:1): the bus echoes every byte, and RSS
+	// allows ~20 ms for it, less than a USB adapter's round trip may take.
+	// Echo locally at once and drop the hardware copy when it arrives; a
+	// hardware byte that differs is passed on, so collisions still show.
+	bool ribEcho = true;
+	std::deque<uint8_t> ribLocalEcho;
+	std::deque<std::pair<uint8_t, pic_tickindex_t>> ribHwEcho;
+	static constexpr double RIB_HW_ECHO_TIMEOUT = 250.0;	// ms; a hardware echo older than this never came
+	void ribDeliverEcho();
+	// With local echo, bytes are held and written to the port together: the
+	// radio drops a message whose bytes are more than ~2 ms apart, and an
+	// emulator running slower than real time spreads them further. They go
+	// out once a whole SB9600 message (5 bytes) is held, or once the program
+	// pauses for two byte times.
+	std::vector<uint8_t> ribTx;
+	pic_tickindex_t ribTxLast = 0;
+	static constexpr size_t RIB_MESSAGE_LEN = 5;
+	void ribFlush();
 
 #if SERIAL_DEBUG
 	bool dbgmsg_poll_block = false;
